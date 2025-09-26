@@ -1,10 +1,10 @@
 MC-WCGAN-GP:
 
-# ------------------------------
-# Complete Code for Synthetic Data Generation
-# Using MC_WCGAN_GP 
+
+#Synthetic Data Generation
+
 # Dataset-agnostic template
-# ------------------------------
+
 
 import numpy as np
 import pandas as pd
