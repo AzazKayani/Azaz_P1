@@ -1,1 +1,309 @@
+# Dataset-agnostic WCGAN-GP 
+# - Replace DATA_PATH / LABEL_COL at the top with your CSV path or URL
+
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.autograd as autograd
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+
+# DATA_PATH to your file
+
+
+DATA_PATH = "path_or_url_to_your_dataset.csv"  # <-- set this
+LABEL_COL = "target"                           # <-- set this
+NUMERIC_COLS = []  # e.g. ["age", "height"]
+CATEGORICAL_COLS = []  # e.g. ["gender", "country"]
+
+try:
+    df = pd.read_csv(DATA_PATH)
+except Exception as e:
+    raise RuntimeError(f"Failed to read dataset from DATA_PATH={DATA_PATH}. Please set DATA_PATH to a valid CSV file path or URL. Original error: {e}")
+
+if LABEL_COL not in df.columns:
+    raise ValueError(f"LABEL_COL='{LABEL_COL}' not found in the dataset columns: {list(df.columns)}")
+
+
+if not NUMERIC_COLS:
+    inferred_numeric = df.select_dtypes(include=[np.number]).columns.tolist()
+    inferred_numeric = [c for c in inferred_numeric if c != LABEL_COL]
+    numeric_cols = inferred_numeric
+else:
+    numeric_cols = NUMERIC_COLS
+
+if not CATEGORICAL_COLS:
+    inferred_cat = df.select_dtypes(include=["object", "category"]).columns.tolist()
+    inferred_cat = [c for c in inferred_cat if c != LABEL_COL]
+    categorical_cols = inferred_cat
+else:
+    categorical_cols = CATEGORICAL_COLS
+
+print("Using numeric columns:", numeric_cols)
+print("Using categorical columns:", categorical_cols)
+print("Label column:", LABEL_COL)
+
+
+features_numeric = df[numeric_cols].copy() if len(numeric_cols) > 0 else pd.DataFrame(index=df.index)
+features_categorical = df[categorical_cols].copy() if len(categorical_cols) > 0 else pd.DataFrame(index=df.index)
+labels = df[LABEL_COL].copy()
+
+
+if len(numeric_cols) > 0:
+    try:
+        features_numeric = features_numeric.apply(pd.to_numeric)
+    except Exception as e:
+        raise RuntimeError(f"Error converting numeric columns to numeric type: {e}")
+
+
+scaler = MinMaxScaler()
+if features_numeric.shape[1] > 0:
+    try:
+        X_numeric = scaler.fit_transform(features_numeric)
+    except Exception as e:
+        raise RuntimeError(f"Error during scaling of numeric features: {e}")
+    X_numeric = X_numeric.astype('float32')
+else:
+    X_numeric = np.zeros((len(df), 0), dtype=np.float32)
+print("Numeric feature shape:", X_numeric.shape)
+
+
+if features_categorical.shape[1] > 0:
+    encoder_cat = OneHotEncoder(sparse_output=False)
+    try:
+        X_cat = encoder_cat.fit_transform(features_categorical)
+    except Exception as e:
+        raise RuntimeError(f"Error during one-hot encoding of categorical features: {e}")
+    X_cat = X_cat.astype('float32')
+else:
+    X_cat = np.zeros((len(df), 0), dtype=np.float32)
+print("Categorical feature shape:", X_cat.shape)
+
+
+X = np.concatenate([X_numeric, X_cat], axis=1)
+print("Final input shape:", X.shape)
+
+
+encoder_label = OneHotEncoder(sparse_output=False)
+y_onehot = encoder_label.fit_transform(labels.values.reshape(-1, 1))
+unique_labels = np.unique(labels)
+label_map = {label: idx for idx, label in enumerate(unique_labels)}
+y_numeric = np.array([label_map[label] for label in labels])
+print("Label mapping:", label_map)
+
+
+X_train, X_test, y_train_num, y_test_num = train_test_split(X, y_numeric, test_size=0.2, random_state=42)
+X_train_tensor = torch.tensor(X_train, dtype=torch.float32, device=device)
+y_train_tensor = torch.tensor(y_train_num, dtype=torch.long, device=device)
+train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+batch_size = 64
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+input_dim = X_train_tensor.shape[1]
+print("Input dimension (features):", input_dim)
+
+
+noise_dim = 30       
+latent_dim = 0       # No extra latent input (no VAE) in this variant.
+lambda_gp = 10.0     
+lambda_label = 30.0  
+gen_lr = 0.0005      
+disc_lr = 0.0002     
+gan_epochs = 700     
+num_classes = len(np.unique(y_train_num))
+
+class Generator(nn.Module):
+    def __init__(self, noise_dim, latent_dim, num_classes, output_dim):
+        super(Generator, self).__init__()
+        self.fc_label = nn.Linear(num_classes, 30)
+        self.fc = nn.Sequential(
+            nn.Linear(noise_dim + latent_dim + 30, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+        self.gen_out = nn.Linear(512, output_dim)
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_classes)
+        )
+        self.class_temp = 3.0
+        self.hybrid_proj = nn.Linear(noise_dim + latent_dim, 512)
+
+    def forward(self, z, v, class_onehot):
+        label_emb = F.relu(self.fc_label(class_onehot))
+        x = torch.cat([z, v, label_emb], dim=1)
+        h = self.fc(x)
+        out = torch.sigmoid(self.gen_out(h))
+        class_logits = self.classifier(h)
+        class_pred = F.softmax(class_logits * self.class_temp, dim=1)
+        return out, class_pred, h
+
+class Discriminator(nn.Module):
+    def __init__(self, input_dim, num_classes):
+        super(Discriminator, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.1),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.1)
+        )
+        self.adv_out = nn.Linear(256, 1)
+        self.classifier = nn.Linear(256, num_classes)
+
+    def forward(self, x):
+        h = self.fc(x)
+        adv = self.adv_out(h)
+        class_pred = F.softmax(self.classifier(h), dim=1)
+        return adv, class_pred
+
+
+generator = Generator(noise_dim, latent_dim, num_classes, input_dim).to(device)
+discriminator = Discriminator(input_dim, num_classes).to(device)
+g_optimizer = optim.Adam(generator.parameters(), lr=gen_lr, betas=(0.5, 0.999), weight_decay=1e-5)
+d_optimizer = optim.Adam(discriminator.parameters(), lr=disc_lr, betas=(0.5, 0.999), weight_decay=1e-5)
+
+
+def compute_gradient_penalty(D, real_samples, fake_samples):
+    alpha = torch.rand(real_samples.size(0), 1, device=device)
+    alpha = alpha.expand_as(real_samples)
+    interpolates = (alpha * real_samples + (1 - alpha) * fake_samples).requires_grad_(True)
+    d_interpolates, _ = D(interpolates)
+    fake_out = torch.ones(real_samples.size(0), 1, device=device)
+    gradients = autograd.grad(outputs=d_interpolates, inputs=interpolates,
+                              grad_outputs=fake_out, create_graph=True,
+                              retain_graph=True, only_inputs=True)[0]
+    gradients = gradients.view(gradients.size(0), -1)
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    return gradient_penalty
+
+
+gan_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+gan_loader = DataLoader(gan_dataset, batch_size=batch_size, shuffle=True)
+
+print("\nStarting WCGAN-GP training on your dataset...")
+for epoch in range(gan_epochs):
+    for batch_idx, (real_samples, real_labels) in enumerate(gan_loader):
+        current_bs = real_samples.size(0)
+        real_labels_onehot = F.one_hot(real_labels, num_classes).float()
+
+        # Discriminator update
+        d_optimizer.zero_grad()
+        real_validity, real_class_pred = discriminator(real_samples)
+
+        z = torch.rand(current_bs, noise_dim, device=device) * 2 - 1
+        v = torch.empty((current_bs, latent_dim), device=device)
+
+        fake_samples, fake_class_pred, _ = generator(z, v, real_labels_onehot)
+        fake_validity, _ = discriminator(fake_samples.detach())
+
+        d_loss_adv = -torch.mean(real_validity) + torch.mean(fake_validity)
+        grad_penalty = compute_gradient_penalty(discriminator, real_samples.data, fake_samples.data)
+        d_loss_label = F.cross_entropy(real_class_pred, real_labels)
+        d_loss_total = d_loss_adv + lambda_gp * grad_penalty + lambda_label * d_loss_label
+
+        d_loss_total.backward()
+        d_optimizer.step()
+
+        
+        g_optimizer.zero_grad()
+        z = torch.rand(current_bs, noise_dim, device=device) * 2 - 1
+        v = torch.empty((current_bs, latent_dim), device=device)
+        fake_samples, fake_class_pred, _ = generator(z, v, real_labels_onehot)
+        fake_validity, _ = discriminator(fake_samples)
+        g_loss_adv = -torch.mean(fake_validity)
+        g_loss_label = F.cross_entropy(fake_class_pred, real_labels)
+        g_loss_total = g_loss_adv + lambda_label * g_loss_label
+
+        g_loss_total.backward()
+        g_optimizer.step()
+
+    if epoch % 20 == 0:
+        print(f"Epoch {epoch}: D_loss = {d_loss_total.item():.4f}, G_loss = {g_loss_total.item():.4f}")
+
+
+class_counts = pd.Series(y_train_num).value_counts().sort_index()
+n_max = class_counts.max()
+req_samples = {cl: n_max - count for cl, count in class_counts.items()}
+print("\nClass counts (train):\n", class_counts)
+print("Required synthetic samples per class:", req_samples)
+
+synthetic_data_final = []
+synthetic_labels_final = []
+
+generator.eval()
+with torch.no_grad():
+    for orig_class, count in class_counts.items():
+        num_needed = n_max - count
+        if num_needed > 0:
+            samples_generated = []
+            while len(samples_generated) < num_needed:
+                batch_gen = min(batch_size, num_needed - len(samples_generated))
+                z_sample = torch.rand(batch_gen, noise_dim, device=device) * 2 - 1
+                v_sample = torch.empty((batch_gen, latent_dim), device=device)
+                class_idx = label_map[orig_class]
+                class_onehot = F.one_hot(torch.tensor([class_idx] * batch_gen, device=device), num_classes).float()
+                fake_samples, _, _ = generator(z_sample, v_sample, class_onehot)
+                samples_generated.extend(fake_samples.cpu().numpy())
+            samples_generated = np.array(samples_generated[:num_needed])
+            synthetic_data_final.append(samples_generated)
+            synthetic_labels_final.append(np.array([orig_class] * num_needed))
+
+    if len(synthetic_data_final) > 0:
+        synthetic_data_final = np.concatenate(synthetic_data_final, axis=0)
+        synthetic_labels_final = np.concatenate(synthetic_labels_final, axis=0)
+    else:
+        synthetic_data_final = np.array([])
+
+print("Generated synthetic samples shape:", synthetic_data_final.shape)
+
+
+real_data_np = X_train_tensor.cpu().detach().numpy()
+if synthetic_data_final.size == 0:
+    raise ValueError("No synthetic data generated. Check the training loop or dataset settings.")
+synth_data_np = synthetic_data_final
+
+all_data = np.vstack([real_data_np, synth_data_np])
+tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42)
+tsne_result = tsne.fit_transform(all_data)
+
+n_real = real_data_np.shape[0]
+real_tsne = tsne_result[:n_real]
+synth_tsne = tsne_result[n_real:]
+plt.figure(figsize=(8,6))
+plt.scatter(real_tsne[:, 0], real_tsne[:, 1], alpha=0.5, label="Real Data")
+plt.scatter(synth_tsne[:, 0], synth_tsne[:, 1], alpha=0.5, label="Synthetic Data")
+plt.xlabel("t-SNE Dimension 1")
+plt.ylabel("t-SNE Dimension 2")
+plt.title("t-SNE Visualization of Real vs. Synthetic Data")
+plt.legend()
+plt.show()
+
+print("\nScript finished.")
+
 
