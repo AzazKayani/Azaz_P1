@@ -1,0 +1,34 @@
+					Evaluation Metrics:
+
+1) Jensen–Shannon Divergence (JSD):
+ 
+JSD(P∥Q)=1/2DKL(P∥M)+1/2DKL(Q∥M)
+
+2) Maximum Mean Discrepancy (MMD):
+ 
+MMD2 (P, Q) = 1/m2 ∑i,i'k(xi,xi')+1/n2 ∑j,j'k(yj,yj')-2/mn ∑i,jk(xi,yj),       
+ 
+
+3) Wasserstein Distance
+W(P,Q)=infγ∈Π(P,Q)E(x,y)∼γ[∥x-y∥],      
+
+4) Coverage
+Coverage=(∣C∣)/Xreal 
+
+5) Model Score
+Model Score= ∑_xiλi.Mi     
+
+					Classification Metrics
+
+6) Precision
+ 
+7) Recall
+
+8) Accuracy
+
+9) F1 Score
+
+10) G-Mean
+
+11) Area Under Curve
+
